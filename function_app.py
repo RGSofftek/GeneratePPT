@@ -1,7 +1,6 @@
 """
 Módulo de Azure Function que genera una presentación PowerPoint integrando visualizaciones de datos.
-Descarga archivos Excel y una plantilla PowerPoint desde Azure File Share, genera gráficos, los inserta en diapositivas dinámicas,
-sube la presentación generada y devuelve una URL pública.
+En este experimento, usa las diapositivas 3 a 5 de la plantilla existente, respetando sus títulos y agregando imágenes y análisis dinámicamente.
 """
 
 import azure.functions as func
@@ -35,7 +34,6 @@ SERVICE_CLIENT = ShareServiceClient(account_url=service_url, credential=SAS_TOKE
 SHARE_CLIENT = SERVICE_CLIENT.get_share_client(FILE_SHARE_NAME)
 
 def download_file_from_share(temp_dir: str, filename: str, folder: str) -> str:
-    """Descarga un archivo desde Azure File Share y lo guarda localmente."""
     directory_client = SHARE_CLIENT.get_directory_client(folder)
     file_client = directory_client.get_file_client(filename)
     stream = file_client.download_file()
@@ -46,7 +44,6 @@ def download_file_from_share(temp_dir: str, filename: str, folder: str) -> str:
     return local_file_path
 
 def upload_file_to_share(local_file_path: str, filename: str, folder: str) -> None:
-    """Sube un archivo local a Azure File Share."""
     directory_client = SHARE_CLIENT.get_directory_client(folder)
     file_client = directory_client.get_file_client(filename)
     try:
@@ -58,11 +55,9 @@ def upload_file_to_share(local_file_path: str, filename: str, folder: str) -> No
     logging.info(f"Subido archivo '{filename}' a '{folder}'")
 
 def generate_file_url(filename: str, folder: str) -> str:
-    """Genera una URL pública para un archivo en Azure File Share."""
     return f"https://{STORAGE_ACCOUNT_NAME}.file.core.windows.net/{FILE_SHARE_NAME}/{folder}/{filename}?{SAS_TOKEN}"
 
 def retry_call(func_call, attempts: int = 2, delay: int = 1):
-    """Ejecuta una función con lógica de reintentos."""
     last_exception = None
     for attempt in range(attempts):
         try:
@@ -73,38 +68,31 @@ def retry_call(func_call, attempts: int = 2, delay: int = 1):
             time.sleep(delay)
     raise last_exception
 
-def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None):
+def add_content_to_existing_slide(prs: Presentation, slide, images: list):
     """
-    Crea una diapositiva dinámica sin usar placeholders existentes:
-    - Agrega título, imágenes y análisis usando textboxes e imágenes personalizadas.
+    Agrega imágenes y análisis a una diapositiva existente, respetando el título preexistente.
+    Usa las dimensiones de la presentación (prs) para calcular el espacio disponible.
     """
-    blank_layout = prs.slide_layouts[6]  # Layout "Blank"
-    slide = prs.slides.add_slide(blank_layout)
-
-    # Definir márgenes y alturas fijas
+    # Definir márgenes y alturas
     margin = Inches(0.5)
-    title_height = Inches(1) if title_text else 0
     analysis_height = Inches(1)
-    available_height = prs.slide_height - 2 * margin - title_height - analysis_height
+
+    # Encontrar el título existente (buscar el shape más alto en la parte superior)
+    title_shape = None
+    for shape in slide.shapes:
+        if shape.has_text_frame and shape.text.strip() and shape.top < Inches(2):  # Asumimos que el título está arriba
+            title_shape = shape
+            break
+
+    # Calcular espacio disponible debajo del título
+    if title_shape:
+        title_bottom = title_shape.top + title_shape.height
+    else:
+        title_bottom = margin  # Si no hay título, usar margen superior
+
+    available_height = prs.slide_height - title_bottom - margin - analysis_height
     available_width = prs.slide_width - 2 * margin
-
-    # Insertar título como textbox
-    if title_text:
-        txBox = slide.shapes.add_textbox(
-            left=margin,
-            top=margin,
-            width=available_width,
-            height=title_height
-        )
-        tf = txBox.text_frame
-        tf.text = title_text
-        for paragraph in tf.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(24)
-                run.font.bold = True
-
-    # Calcular espacio para imágenes
-    images_top = margin + title_height
+    images_top = title_bottom
     images_left = margin
 
     # Determinar rejilla según el número de imágenes
@@ -160,8 +148,6 @@ def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None
         for run in paragraph.runs:
             run.font.size = Pt(14)
             run.font.color.rgb = RGBColor(80, 80, 80)
-
-    return slide
 
 def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> BytesIO:
     df_users = pd.read_excel(users_file_path)
@@ -268,9 +254,15 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
             maturity_imgs = retry_call(lambda: generate_maturity_graphs(maturity_file_path, users_file_path, matricula_lider, q))
             
             prs = Presentation(template_file_path)
-            create_dynamic_slide(prs, images=[kpr_img], title_text=f"KPR - {q}")
-            create_dynamic_slide(prs, images=[kr_img], title_text="KR")
-            create_dynamic_slide(prs, images=maturity_imgs, title_text="Niveles de Madurez")
+            
+            # Asegurarse de que haya al menos 5 diapositivas
+            if len(prs.slides) < 5:
+                raise ValueError("La plantilla debe tener al menos 5 diapositivas.")
+            
+            # Agregar contenido a las diapositivas existentes (índices 2, 3, 4 corresponden a diapositivas 3, 4, 5)
+            add_content_to_existing_slide(prs, prs.slides[2], images=[kpr_img])
+            add_content_to_existing_slide(prs, prs.slides[3], images=[kr_img])
+            add_content_to_existing_slide(prs, prs.slides[4], images=maturity_imgs)
             
             file_date = datetime.now().strftime("%m%d%y")
             output_filename = f"{file_date} Presentation.pptx"
