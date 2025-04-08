@@ -2,17 +2,6 @@
 Módulo de Azure Function que genera una presentación PowerPoint integrando visualizaciones de datos.
 Descarga archivos Excel y una plantilla PowerPoint desde Azure File Share, genera gráficos, los inserta en diapositivas dinámicas,
 sube la presentación generada y devuelve una URL pública.
-
-Cuerpo JSON esperado:
-{
-  "q": "<trimestre_o_métrica>",
-  "matricula_lider": "<identificador_líder>",
-  "tmd_file": "<nombre_archivo_TMD>",
-  "users_file": "<nombre_archivo_usuarios>",
-  "pases_file": "<nombre_archivo_pases>",
-  "revisiones_file": "<nombre_archivo_revisiones>",
-  "maturity_level_file": "<nombre_archivo_nivel_madurez>"
-}
 """
 
 import azure.functions as func
@@ -22,7 +11,6 @@ import json
 import time
 from datetime import datetime
 from pptx import Presentation
-from pptx.enum.shapes import PP_PLACEHOLDER_TYPE
 from pptx.util import Pt, Inches
 from pptx.dml.color import RGBColor
 from io import BytesIO
@@ -42,7 +30,6 @@ TEMPLATES_DIRECTORY = f"{DIRECTORY_NAME}/templates"
 INPUTS_DIRECTORY = f"{DIRECTORY_NAME}/inputs"
 OUTPUTS_DIRECTORY = f"{DIRECTORY_NAME}/outputs"
 
-# Cliente de Azure File Share
 service_url = f"https://{STORAGE_ACCOUNT_NAME}.file.core.windows.net"
 SERVICE_CLIENT = ShareServiceClient(account_url=service_url, credential=SAS_TOKEN)
 SHARE_CLIENT = SERVICE_CLIENT.get_share_client(FILE_SHARE_NAME)
@@ -64,7 +51,6 @@ def upload_file_to_share(local_file_path: str, filename: str, folder: str) -> No
     file_client = directory_client.get_file_client(filename)
     try:
         file_client.delete_file()
-        logging.info(f"Eliminado archivo existente '{filename}' en '{folder}'.")
     except Exception:
         pass
     with open(local_file_path, 'rb') as data:
@@ -87,38 +73,29 @@ def retry_call(func_call, attempts: int = 2, delay: int = 1):
             time.sleep(delay)
     raise last_exception
 
-def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None, layout_index: int = 1):
+def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None):
     """
-    Crea una diapositiva dinámica:
-    - Usa placeholders para título y análisis si están disponibles.
-    - Distribuye imágenes dinámicamente entre título y análisis.
-    - Inserta análisis de OpenAI en un placeholder o posición calculada.
+    Crea una diapositiva dinámica sin usar placeholders existentes:
+    - Agrega título, imágenes y análisis usando textboxes e imágenes personalizadas.
     """
-    try:
-        slide_layout = prs.slide_layouts[layout_index]
-    except IndexError:
-        logging.warning(f"Índice de layout {layout_index} no encontrado. Usando layout en blanco.")
-        slide_layout = prs.slide_layouts[6]  # Fallback a layout en blanco
-    slide = prs.slides.add_slide(slide_layout)
+    blank_layout = prs.slide_layouts[6]  # Layout "Blank"
+    slide = prs.slides.add_slide(blank_layout)
 
-    # Identificar placeholders
-    title_placeholder = None
-    content_placeholder = None
-    for placeholder in slide.placeholders:
-        if placeholder.placeholder_format.type == PP_PLACEHOLDER_TYPE.TITLE:
-            title_placeholder = placeholder
-        elif placeholder.placeholder_format.type == PP_PLACEHOLDER_TYPE.BODY:
-            content_placeholder = placeholder
+    # Definir márgenes y alturas fijas
+    margin = Inches(0.5)
+    title_height = Inches(1) if title_text else 0
+    analysis_height = Inches(1)
+    available_height = prs.slide_height - 2 * margin - title_height - analysis_height
+    available_width = prs.slide_width - 2 * margin
 
-    # Insertar título si se proporciona
-    if title_placeholder and title_text:
-        title_placeholder.text = title_text
-        for paragraph in title_placeholder.text_frame.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(24)
-                run.font.bold = True
-    elif title_text:
-        txBox = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), prs.slide_width - Inches(1), Inches(1))
+    # Insertar título como textbox
+    if title_text:
+        txBox = slide.shapes.add_textbox(
+            left=margin,
+            top=margin,
+            width=available_width,
+            height=title_height
+        )
         tf = txBox.text_frame
         tf.text = title_text
         for paragraph in tf.paragraphs:
@@ -126,44 +103,11 @@ def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None
                 run.font.size = Pt(24)
                 run.font.bold = True
 
-    # Obtener texto de análisis (simulado)
-    analysis_text = get_analysis_text({"type": title_text.split(" - ")[0] if title_text else "General"})
+    # Calcular espacio para imágenes
+    images_top = margin + title_height
+    images_left = margin
 
-    # Insertar análisis si hay placeholder
-    if content_placeholder:
-        content_placeholder.text = analysis_text
-        for paragraph in content_placeholder.text_frame.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(14)
-                run.font.color.rgb = RGBColor(80, 80, 80)
-    else:
-        analysisBox = slide.shapes.add_textbox(Inches(0.5), prs.slide_height - Inches(1.5), prs.slide_width - Inches(1), Inches(1))
-        analysis_tf = analysisBox.text_frame
-        analysis_tf.text = analysis_text
-        for paragraph in analysis_tf.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(14)
-                run.font.color.rgb = RGBColor(80, 80, 80)
-
-    # Calcular espacio disponible para imágenes
-    if title_placeholder and content_placeholder:
-        top = title_placeholder.top + title_placeholder.height
-        bottom = content_placeholder.top
-        left = Inches(0.5)
-        right = prs.slide_width - Inches(0.5)
-        available_width = right - left
-        available_height = bottom - top
-    else:
-        margin = Inches(0.5)
-        title_height = Inches(1) if title_text else 0
-        analysis_height = Inches(1) if analysis_text else 0
-        top = margin + title_height
-        available_height = prs.slide_height - 2 * margin - title_height - analysis_height
-        left = margin
-        right = prs.slide_width - margin
-        available_width = right - left
-
-    # Determinar rejilla según número de imágenes
+    # Determinar rejilla según el número de imágenes
     num_images = len(images)
     if num_images == 1:
         rows, cols = 1, 1
@@ -182,15 +126,14 @@ def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None
     for i, img_stream in enumerate(images):
         col = i % cols
         row = i // cols
-        cell_left = left + col * cell_width
-        cell_top = top + row * cell_height
-        
+        cell_left = images_left + col * cell_width
+        cell_top = images_top + row * cell_height
+
         img_stream.seek(0)
         img = Image.open(img_stream)
         orig_w, orig_h = img.size
         img_stream.seek(0)
 
-        # Escalar manteniendo proporción
         if (cell_width / cell_height) > (orig_w / orig_h):
             picture_height = cell_height
             picture_width = cell_height * (orig_w / orig_h)
@@ -203,19 +146,28 @@ def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None
 
         slide.shapes.add_picture(img_stream, picture_left, picture_top, width=picture_width, height=picture_height)
 
+    # Insertar análisis como textbox
+    analysis_text = "Este es el análisis generado para la gráfica."
+    analysisBox = slide.shapes.add_textbox(
+        left=margin,
+        top=prs.slide_height - margin - analysis_height,
+        width=available_width,
+        height=analysis_height
+    )
+    analysis_tf = analysisBox.text_frame
+    analysis_tf.text = analysis_text
+    for paragraph in analysis_tf.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(14)
+            run.font.color.rgb = RGBColor(80, 80, 80)
+
     return slide
 
-def get_analysis_text(image_info: dict) -> str:
-    """Simula un análisis basado en información de la imagen. Reemplazar con integración de OpenAI si es necesario."""
-    return f"Análisis generado para el tipo {image_info.get('type', 'desconocido')}."
-
-# Funciones de generación de gráficos (sin cambios significativos para esta revisión)
 def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> BytesIO:
     df_users = pd.read_excel(users_file_path)
     df_tmd = pd.read_excel(tmd_file_path)
     users_list = df_users[df_users['Matricula Lider'] == matricula_lider]['Matricula'].tolist()
     df_filtered = df_tmd[df_tmd["Matricula LT"].isin(users_list)]
-    
     plt.figure(figsize=(10, 6))
     plt.bar(df_filtered["Lider Técnico"], df_filtered[q], color='#000474')
     plt.title(f'{q} Values by Selected Lider Técnico (KPR)', fontsize=16)
@@ -223,7 +175,6 @@ def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider
     plt.ylabel(q, fontsize=12)
     plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
-    
     img_bytes = BytesIO()
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
@@ -234,10 +185,8 @@ def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesI
     quarters = ['Q1 01', 'Q1 02', 'Q1 03', 'Q2 01', 'Q2 02', 'Q2 03']
     df1 = pd.read_excel(pases_file_path)
     df2 = pd.read_excel(revisiones_file_path)
-    
     df1_grouped = df1[quarters].sum(axis=0)
     df2_grouped = df2[quarters].sum(axis=0)
-    
     plt.figure(figsize=(10, 7))
     x = range(len(quarters))
     plt.bar([pos - 0.2 for pos in x], df1_grouped, color='#000474', width=0.4, label='Dataset 1')
@@ -248,7 +197,6 @@ def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesI
     plt.xticks(ticks=x, labels=quarters)
     plt.legend()
     plt.tight_layout()
-    
     img_bytes = BytesIO()
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
@@ -260,7 +208,6 @@ def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matr
     df_maturity = pd.read_excel(maturity_file_path)
     users_list = df_users[df_users['Matricula Lider'] == matricula_lider]['Matricula'].tolist()
     df_filtered = df_maturity[df_maturity["Matricula LT"].isin(users_list)]
-    
     practices = df_filtered['PRACTICA'].unique()
     maturity_images = []
     for practice in practices[:4]:
@@ -272,7 +219,6 @@ def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matr
         plt.ylabel(f'Nivel de Madurez ({q})', fontsize=12)
         plt.xticks(rotation=45)
         plt.tight_layout()
-        
         img_bytes = BytesIO()
         plt.savefig(img_bytes, format='png')
         img_bytes.seek(0)
@@ -280,7 +226,6 @@ def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matr
         maturity_images.append(img_bytes)
     return maturity_images
 
-# Función principal de Azure
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 @app.function_name(name="generate_presentation")
@@ -323,9 +268,9 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
             maturity_imgs = retry_call(lambda: generate_maturity_graphs(maturity_file_path, users_file_path, matricula_lider, q))
             
             prs = Presentation(template_file_path)
-            create_dynamic_slide(prs, images=[kpr_img], title_text=f"KPR - {q}", layout_index=1)
-            create_dynamic_slide(prs, images=[kr_img], title_text="KR", layout_index=1)
-            create_dynamic_slide(prs, images=maturity_imgs, title_text="Niveles de Madurez", layout_index=1)
+            create_dynamic_slide(prs, images=[kpr_img], title_text=f"KPR - {q}")
+            create_dynamic_slide(prs, images=[kr_img], title_text="KR")
+            create_dynamic_slide(prs, images=maturity_imgs, title_text="Niveles de Madurez")
             
             file_date = datetime.now().strftime("%m%d%y")
             output_filename = f"{file_date} Presentation.pptx"
