@@ -1,7 +1,7 @@
 """
 This Azure Function module generates a PowerPoint presentation by integrating several data visualizations.
 It downloads input Excel files and a PowerPoint template from an Azure File Share, generates graphs based on 
-the Excel data, inserts them into designated slides in the template, uploads the final presentation back to the share,
+the Excel data, inserts them into dynamically created slides, uploads the final presentation back to the share,
 and returns a public URL for the generated PPT.
 
 Expected JSON Request Body:
@@ -26,26 +26,25 @@ import json
 import time
 from datetime import datetime
 from pptx import Presentation
-from pptx.util import Pt
+from pptx.util import Pt, Inches
+from pptx.dml.color import RGBColor
 from io import BytesIO
 from azure.storage.fileshare import ShareServiceClient
 import pandas as pd
 import matplotlib.pyplot as plt
 import tempfile
+from PIL import Image  # Para obtener dimensiones originales (opcional)
 
 # Environment variables and storage structure definitions
 STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME")
 SAS_TOKEN = os.environ.get("SAS_TOKEN")
 AUTH_TOKEN_EXPECTED = os.environ.get("AUTH_TOKEN")  # Expected token for authentication
-# Folder structure in the Azure File Share
-FILE_SHARE_NAME = os.environ.get("FILE_SHARE_NAME") # Name of the Azure File Share
-DIRECTORY_NAME = os.environ.get("DIRECTORY_NAME")  # Root directory for the function
-TEMPLATES_DIRECTORY = f"{DIRECTORY_NAME}/templates"   # Folder for PowerPoint templates
+
+FILE_SHARE_NAME = os.environ.get("FILE_SHARE_NAME")  # Name of the Azure File Share
+DIRECTORY_NAME = os.environ.get("DIRECTORY_NAME")      # Root directory for the function
+TEMPLATES_DIRECTORY = f"{DIRECTORY_NAME}/templates"     # Folder for PowerPoint templates
 INPUTS_DIRECTORY = f"{DIRECTORY_NAME}/inputs"           # Folder for Excel input files
 OUTPUTS_DIRECTORY = f"{DIRECTORY_NAME}/outputs"         # Folder for generated presentations
-
-# Predefined position for inserting KR and KPR graphs in the PPT slides
-GRAPH_POSITION = (Pt(220), Pt(150), Pt(350), Pt(700))
 
 # Initialize the Azure File Share client
 service_url = f"https://{STORAGE_ACCOUNT_NAME}.file.core.windows.net"
@@ -55,14 +54,6 @@ SHARE_CLIENT = SERVICE_CLIENT.get_share_client(FILE_SHARE_NAME)
 def download_file_from_share(temp_dir: str, filename: str, folder: str) -> str:
     """
     Downloads a file from the specified Azure File Share folder and saves it locally.
-    
-    Args:
-        temp_dir (str): Local temporary directory to store the downloaded file.
-        filename (str): Name of the file to download.
-        folder (str): Folder in the Azure File Share where the file is stored.
-    
-    Returns:
-        str: The full local path of the downloaded file.
     """
     directory_client = SHARE_CLIENT.get_directory_client(folder)
     file_client = directory_client.get_file_client(filename)
@@ -77,14 +68,6 @@ def download_file_from_share(temp_dir: str, filename: str, folder: str) -> str:
 def upload_file_to_share(local_file_path: str, filename: str, folder: str) -> None:
     """
     Uploads a local file to the specified folder in the Azure File Share.
-    
-    The function first attempts to delete an existing file (to simulate overwriting),
-    then uploads the new file.
-    
-    Args:
-        local_file_path (str): Full path of the local file.
-        filename (str): Name to use for the file on the share.
-        folder (str): Destination folder in the file share.
     """
     directory_client = SHARE_CLIENT.get_directory_client(folder)
     file_client = directory_client.get_file_client(filename)
@@ -101,30 +84,12 @@ def upload_file_to_share(local_file_path: str, filename: str, folder: str) -> No
 def generate_file_url(filename: str, folder: str) -> str:
     """
     Constructs a public URL for a file in the Azure File Share using the SAS token.
-    
-    Args:
-        filename (str): Name of the file.
-        folder (str): Folder in the file share where the file is stored.
-    
-    Returns:
-        str: Public URL granting read access (SAS_TOKEN must be appropriately configured).
     """
     return f"https://{STORAGE_ACCOUNT_NAME}.file.core.windows.net/{FILE_SHARE_NAME}/{folder}/{filename}?{SAS_TOKEN}"
 
 def retry_call(func_call, attempts: int = 2, delay: int = 1):
     """
     Executes a function with retry logic in case of transient errors.
-    
-    Args:
-        func_call: A no-argument callable representing the function to execute.
-        attempts (int): Maximum number of attempts (default is 2).
-        delay (int): Delay in seconds between attempts (default is 1).
-    
-    Returns:
-        The result of the callable if successful.
-    
-    Raises:
-        Exception: The last exception encountered if all attempts fail.
     """
     last_exception = None
     for attempt in range(attempts):
@@ -139,73 +104,156 @@ def retry_call(func_call, attempts: int = 2, delay: int = 1):
 def insert_picture_on_slide(slide, image: BytesIO, position: tuple) -> None:
     """
     Inserts an image into a PowerPoint slide at the specified position.
-    
-    Args:
-        slide: The pptx slide object.
-        image (BytesIO): Image data as a BytesIO stream.
-        position (tuple): Tuple specifying (left, top, width, height) using pptx.util units.
+    Position is a tuple (left, top, width, height) using pptx.util units.
     """
     left, top, width, height = position
     slide.shapes.add_picture(image, left, top, width=width, height=height)
 
+# --- New functions for dynamic layout ---
+
+def calculate_dynamic_layout(slide_width, slide_height, num_images, include_title=True, include_analysis=True):
+    """
+    Calculates and returns:
+      - title_area: (left, top, width, height) for the title (if applicable)
+      - image_positions: list of positions (left, top, width, height) for each image
+      - analysis_area: (left, top, width, height) for the analysis block
+    Based on the total slide dimensions and the number of images.
+    """
+    margin = Inches(0.5)
+    usable_width = slide_width - 2 * margin
+    usable_height = slide_height - 2 * margin
+
+    title_area = None
+    analysis_area = None
+
+    title_height = Inches(1) if include_title else 0
+    analysis_height = Inches(1.5) if include_analysis else 0
+
+    images_area_top = margin + title_height
+    images_area_height = usable_height - title_height - analysis_height
+
+    # Determine grid based on number of images
+    if num_images == 1:
+        rows, cols = 1, 1
+    elif num_images <= 2:
+        rows, cols = 1, num_images
+    elif num_images <= 4:
+        rows, cols = 2, 2
+    else:
+        cols = int(num_images ** 0.5)
+        rows = cols if cols * cols >= num_images else cols + 1
+
+    cell_width = usable_width / cols
+    cell_height = images_area_height / rows
+
+    image_positions = []
+    for i in range(num_images):
+        col = i % cols
+        row = i // cols
+        left = margin + col * cell_width
+        top = images_area_top + row * cell_height
+        image_positions.append((left, top, cell_width, cell_height))
+
+    if include_title:
+        title_area = (margin, margin, usable_width, title_height)
+    if include_analysis:
+        analysis_area = (margin, margin + title_height + images_area_height, usable_width, analysis_height)
+
+    return title_area, image_positions, analysis_area
+
+def get_image_dimensions(image_stream: BytesIO):
+    """
+    Uses Pillow to obtain the original dimensions of the image.
+    Returns a tuple (width, height).
+    """
+    image = Image.open(image_stream)
+    return image.size  # (width, height)
+
+def get_analysis_text(image_info: dict) -> str:
+    """
+    Simulates a synchronous call to OpenAI to obtain an analysis based on the graph(s) information.
+    'image_info' may contain data such as type, metrics, etc.
+    """
+    # Here you would integrate the actual call to OpenAI.
+    return "Este es el análisis generado para la gráfica, resaltando tendencias y puntos clave."
+
+def create_dynamic_slide(prs: Presentation, images: list, title_text: str = None):
+    """
+    Creates a new dynamic slide:
+      - Inserts a title (if provided).
+      - Dynamically distributes all images.
+      - Inserts the analysis block obtained from OpenAI.
+    """
+    blank_layout = prs.slide_layouts[6]  # Using the "Blank" layout for flexibility
+    slide = prs.slides.add_slide(blank_layout)
+    
+    slide_width = prs.slide_width
+    slide_height = prs.slide_height
+
+    # Calculate dynamic layout areas
+    title_area, image_positions, analysis_area = calculate_dynamic_layout(
+        slide_width, slide_height, len(images),
+        include_title=(title_text is not None),
+        include_analysis=True
+    )
+
+    # Insert title if provided
+    if title_text and title_area:
+        txBox = slide.shapes.add_textbox(*title_area)
+        tf = txBox.text_frame
+        tf.text = title_text
+        # Optional formatting
+        for paragraph in tf.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(24)
+                run.font.bold = True
+
+    # Insert images at calculated positions
+    for img_stream, pos in zip(images, image_positions):
+        # Optional: adjust scaling using get_image_dimensions to preserve aspect ratio
+        slide.shapes.add_picture(img_stream, *pos)
+
+    # Get and insert analysis text synchronously
+    analysis_text = get_analysis_text({"num_images": len(images)})
+    if analysis_area:
+        analysisBox = slide.shapes.add_textbox(*analysis_area)
+        analysis_tf = analysisBox.text_frame
+        analysis_tf.text = analysis_text
+        # Optional formatting
+        for paragraph in analysis_tf.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(14)
+                run.font.color.rgb = RGBColor(80, 80, 80)
+    
+    return slide
+
+# --- Existing graph generation functions (KPR, KR, Maturity) remain unchanged ---
+
 def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> BytesIO:
-    """
-    Generates the KPR graph using data from the TMD and Users Excel files.
-    
-    The function filters the TMD data for users managed by the provided 'matricula_lider' and plots a 
-    bar chart of the values corresponding to the given quarter (or metric). It annotates each bar with its value.
-    
-    Args:
-        tmd_file_path (str): Path to the TMD Excel file.
-        users_file_path (str): Path to the Users Excel file.
-        matricula_lider (str): The leader identifier used to filter users.
-        q (str): The quarter or metric column name to plot.
-    
-    Returns:
-        BytesIO: Stream containing the generated PNG image.
-    
-    Raises:
-        ValueError: If required columns are missing or no matching data is found.
-    """
-    # Load and validate Users Excel file
     df_users = pd.read_excel(users_file_path)
     required_users_cols = {"Matricula Lider", "Matricula"}
     if not required_users_cols.issubset(set(df_users.columns)):
         raise ValueError(f"Users file is missing required columns: {required_users_cols - set(df_users.columns)}")
     
-    # Load and validate TMD Excel file
     df_tmd = pd.read_excel(tmd_file_path)
     required_tmd_cols = {"Matricula LT", "Lider Técnico", q}
     if not required_tmd_cols.issubset(set(df_tmd.columns)):
         raise ValueError(f"TMD file is missing required columns: {required_tmd_cols - set(df_tmd.columns)}")
     
-    # Filter users based on the provided 'Matricula Lider'
     users_list = df_users[df_users['Matricula Lider'] == matricula_lider]['Matricula'].tolist()
     if not users_list:
         raise ValueError("No users found matching the provided 'Matricula Lider' in the Users file.")
     
-    # Filter TMD data for matching user identifiers
     df_filtered = df_tmd[df_tmd["Matricula LT"].isin(users_list)]
     if df_filtered.empty:
         raise ValueError("No matching 'Lider Técnico' data found in TMD file for KPR graph.")
     
-    # Create the KPR bar chart
     plt.figure(figsize=(10, 6))
     bars = plt.bar(df_filtered["Lider Técnico"], df_filtered[q], color='#000474')
     for bar in bars:
         yval = bar.get_height()
-        plt.text(
-            bar.get_x() + bar.get_width() / 2,  # Horizontal center of the bar
-            yval + 0.5,                        # Slightly above the bar
-            f'{yval:.2f}',                     # Formatted value with 2 decimals
-            ha='center',
-            va='bottom',
-            fontsize=10,
-            color='black',
-            zorder=3
-        )
+        plt.text(bar.get_x() + bar.get_width() / 2, yval + 0.5, f'{yval:.2f}', ha='center', va='bottom', fontsize=10, color='black', zorder=3)
     
-    # Set title and labels with appropriate font sizes
     plt.title(f'{q} Values by Selected Lider Técnico (KPR)', fontsize=16)
     plt.xlabel('Lider Técnico', fontsize=12)
     plt.ylabel(q, fontsize=12)
@@ -213,39 +261,17 @@ def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
 
-    # Save the figure to a BytesIO stream
     img_bytes = BytesIO()
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
     plt.close()
     return img_bytes
 
-
 def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesIO:
-    """
-    Generates the KR graph using data from the Pases and Revisiones Excel files.
-    
-    Both Excel files are expected to contain specific quarter columns. The function sums the values 
-    per quarter for each dataset and plots a side-by-side bar chart for comparison. Each bar is annotated with its value.
-    
-    Args:
-        pases_file_path (str): Path to the Pases Excel file.
-        revisiones_file_path (str): Path to the Revisiones Excel file.
-    
-    Returns:
-        BytesIO: Stream containing the generated PNG image.
-    
-    Raises:
-        ValueError: If required quarter columns are missing in either file.
-    """
-    # Define quarter categories
     quarters = ['Q1 01', 'Q1 02', 'Q1 03', 'Q2 01', 'Q2 02', 'Q2 03']
-    
-    # Load the Excel files
     df1 = pd.read_excel(pases_file_path)
     df2 = pd.read_excel(revisiones_file_path)
     
-    # Validate required quarter columns exist
     missing_df1 = set(quarters) - set(df1.columns)
     missing_df2 = set(quarters) - set(df2.columns)
     if missing_df1:
@@ -253,49 +279,25 @@ def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesI
     if missing_df2:
         raise ValueError(f"Revisiones file is missing required columns: {missing_df2}")
     
-    # Sum values across the quarters for each dataset
     df1_grouped = df1[quarters].sum(axis=0)
     df2_grouped = df2[quarters].sum(axis=0)
 
-    # Calculate positions for side-by-side bars
     bar_width = 0.4
     x = range(len(quarters))
     x1 = [pos - bar_width / 2 for pos in x]
     x2 = [pos + bar_width / 2 for pos in x]
 
-    # Create the KR bar chart
     plt.figure(figsize=(10, 7))
     bars1 = plt.bar(x1, df1_grouped, color='#000474', width=bar_width, label='Dataset 1', edgecolor='black', zorder=2)
     bars2 = plt.bar(x2, df2_grouped, color='#f46a34', width=bar_width, label='Dataset 2', edgecolor='black', zorder=1)
     
-    # Annotate bars for dataset 1
     for bar in bars1:
         yval = bar.get_height()
-        plt.text(
-            bar.get_x() + bar.get_width() / 2,
-            yval,
-            round(yval, 2),
-            va='bottom',
-            ha='center',
-            fontsize=10,
-            color='black',
-            zorder=3
-        )
-    # Annotate bars for dataset 2
+        plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 2), va='bottom', ha='center', fontsize=10, color='black', zorder=3)
     for bar in bars2:
         yval = bar.get_height()
-        plt.text(
-            bar.get_x() + bar.get_width() / 2,
-            yval,
-            round(yval, 2),
-            va='bottom',
-            ha='center',
-            fontsize=10,
-            color='black',
-            zorder=3
-        )
+        plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 2), va='bottom', ha='center', fontsize=10, color='black', zorder=3)
     
-    # Set title and axis labels
     plt.title('Pases Exitosos vs Reversiones x Q (KR)', fontsize=16)
     plt.xlabel('Trimestre', fontsize=12)
     plt.ylabel('Valor Total', fontsize=12)
@@ -304,79 +306,43 @@ def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesI
     plt.legend()
     plt.tight_layout()
 
-    # Save the figure to a BytesIO stream
     img_bytes = BytesIO()
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
     plt.close()
     return img_bytes
 
-
 def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> list:
-    """
-    Generates four maturity level graphs (one per practice) using data from the Maturity and Users Excel files.
-    
-    The function filters the maturity data for users under the specified 'matricula_lider' and creates 
-    a bar chart for each of the first four practices found. Each graph is annotated with bar values.
-    
-    Args:
-        maturity_file_path (str): Path to the Maturity Excel file.
-        users_file_path (str): Path to the Users Excel file.
-        matricula_lider (str): The leader identifier used to filter users.
-        q (str): The quarter or metric column name to plot.
-    
-    Returns:
-        list: A list of BytesIO streams, each containing a PNG image for a practice.
-    
-    Raises:
-        ValueError: If required columns are missing, no matching users are found, 
-                    or if there are fewer than four practices.
-    """
-    # Load and validate Users Excel file
     df_users = pd.read_excel(users_file_path)
     required_users_cols = {"Matricula Lider", "Matricula"}
     if not required_users_cols.issubset(set(df_users.columns)):
         raise ValueError(f"Users file is missing required columns: {required_users_cols - set(df_users.columns)}")
     
-    # Load and validate Maturity Excel file
     df_maturity = pd.read_excel(maturity_file_path)
     required_maturity_cols = {"Matricula LT", "PRACTICA", "Lider Técnico", q}
     if not required_maturity_cols.issubset(set(df_maturity.columns)):
         raise ValueError(f"Maturity file is missing required columns: {required_maturity_cols - set(df_maturity.columns)}")
     
-    # Filter users based on the provided 'Matricula Lider'
     users_list = df_users[df_users['Matricula Lider'] == matricula_lider]['Matricula'].tolist()
     if not users_list:
         raise ValueError("No users found matching the provided 'Matricula Lider' in the Users file.")
     
-    # Filter maturity data for the selected users
     df_filtered = df_maturity[df_maturity["Matricula LT"].isin(users_list)]
     if df_filtered.empty:
         raise ValueError("No matching 'Lider Técnico' data found in Maturity file for the provided 'Matricula Lider'.")
     
-    # Ensure there are at least four practices available
     practices = df_filtered['PRACTICA'].unique()
     if len(practices) < 4:
         raise ValueError(f"Not enough practices for Maturity graphs; expected 4, got {len(practices)}.")
     
     maturity_images = []
-    # Generate graphs for each of the first four practices
     for practice in practices[:4]:
         df_practice = df_filtered[df_filtered['PRACTICA'] == practice]
         plt.figure(figsize=(10, 6))
         bars = plt.bar(df_practice['Lider Técnico'], df_practice[q], color='#000474')
         for bar in bars:
             yval = bar.get_height()
-            plt.text(
-                bar.get_x() + bar.get_width() / 2,
-                yval + 0.1,
-                f'{yval:.2f}',
-                ha='center',
-                va='bottom',
-                fontsize=10,
-                color='black',
-                zorder=3
-            )
+            plt.text(bar.get_x() + bar.get_width() / 2, yval + 0.1, f'{yval:.2f}', ha='center', va='bottom', fontsize=10, color='black', zorder=3)
         plt.xlabel('Lider Técnico', fontsize=12)
         plt.ylabel(f'Nivel de Madurez ({q})', fontsize=12)
         plt.title(f'Niveles de Madurez para {practice}', fontsize=16)
@@ -390,43 +356,22 @@ def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matr
         maturity_images.append(img_bytes)
     return maturity_images
 
-
+# --- Main Azure Function ---
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 @app.function_name(name="generate_presentation")
 @app.route(route="generate_presentation", methods=["POST"])
 def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    HTTP-triggered Azure Function that creates a PowerPoint presentation with embedded graphs.
-    
-    Steps:
-      1. Validates the request for proper JSON payload and authorization.
-      2. Downloads required Excel files and the PowerPoint template from the Azure File Share.
-      3. Generates the KPR, KR, and four Maturity graphs from the Excel files.
-      4. Inserts the generated graphs into specific slides of the template.
-      5. Saves the presentation locally, uploads it to the share, and returns a public URL.
-    
-    Returns:
-        func.HttpResponse: On success, returns a JSON response with {"public_url": "<URL>"}.
-                           On error, returns an appropriate error message.
-    """
     logging.info("Processing generate_presentation request.")
-
-    # Validate authorization
     auth_header = req.headers.get("Authorization")
     if not auth_header or auth_header != AUTH_TOKEN_EXPECTED:
         return func.HttpResponse("Unauthorized", status_code=401)
-    
     try:
         req_body = req.get_json()
     except ValueError:
         return func.HttpResponse("Invalid JSON in request body.", status_code=400)
     
-    # Ensure all required keys are present in the request body
-    required_keys = [
-        "q", "matricula_lider", "tmd_file", "users_file", 
-        "pases_file", "revisiones_file", "maturity_level_file"
-    ]
+    required_keys = ["q", "matricula_lider", "tmd_file", "users_file", "pases_file", "revisiones_file", "maturity_level_file"]
     missing_keys = [key for key in required_keys if key not in req_body]
     if missing_keys:
         return func.HttpResponse(f"Missing required keys: {missing_keys}", status_code=400)
@@ -439,11 +384,9 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
     revisiones_file = req_body["revisiones_file"]
     maturity_level_file = req_body["maturity_level_file"]
     
-    # Use a context manager to create a temporary directory that cleans up automatically
     with tempfile.TemporaryDirectory() as temp_dir:
         logging.info(f"Temporary directory created: {temp_dir}")
         try:
-            # Download Excel input files and the PPT template from Azure File Share
             tmd_file_path = download_file_from_share(temp_dir, tmd_file, INPUTS_DIRECTORY)
             users_file_path = download_file_from_share(temp_dir, users_file, INPUTS_DIRECTORY)
             pases_file_path = download_file_from_share(temp_dir, pases_file, INPUTS_DIRECTORY)
@@ -458,33 +401,21 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
             kr_img = retry_call(lambda: generate_kr_graph(pases_file_path, revisiones_file_path))
             maturity_imgs = retry_call(lambda: generate_maturity_graphs(maturity_file_path, users_file_path, matricula_lider, q))
             
-            # Open the PowerPoint template
+            # Open the base presentation (template)
             prs = Presentation(template_file_path)
-            if len(prs.slides) < 5:
-                return func.HttpResponse("Template does not have enough slides for all graphs.", status_code=500)
             
-            # Insert KR graph on slide 3 (index 2) and KPR graph on slide 4 (index 3)
-            insert_picture_on_slide(prs.slides[2], kr_img, GRAPH_POSITION)
-            insert_picture_on_slide(prs.slides[3], kpr_img, GRAPH_POSITION)
+            # Create dynamic slides for each set of graphs
+            create_dynamic_slide(prs, images=[kpr_img], title_text=f"KPR - {q}")
+            create_dynamic_slide(prs, images=[kr_img], title_text="KR")
+            create_dynamic_slide(prs, images=maturity_imgs, title_text="Niveles de Madurez")
             
-            # Insert the four Maturity graphs on slide 5 (index 4) at predefined positions
-            maturity_positions = [
-                (Pt(120), Pt(150), Pt(170), Pt(300)),
-                (Pt(120), Pt(350), Pt(170), Pt(300)),
-                (Pt(520), Pt(150), Pt(170), Pt(300)),
-                (Pt(520), Pt(350), Pt(170), Pt(300))
-            ]
-            for img, pos in zip(maturity_imgs, maturity_positions):
-                insert_picture_on_slide(prs.slides[4], img, pos)
-            
-            # Save the modified presentation with a date-based filename
+            # Save presentation with date-based filename
             file_date = datetime.now().strftime("%m%d%y")
             output_filename = f"{file_date} Presentation.pptx"
             output_file_path = os.path.join(temp_dir, output_filename)
             prs.save(output_file_path)
             logging.info(f"Presentation saved at {output_file_path}")
             
-            # Upload the presentation to the outputs folder and generate a public URL
             upload_file_to_share(output_file_path, output_filename, OUTPUTS_DIRECTORY)
             public_url = generate_file_url(output_filename, OUTPUTS_DIRECTORY)
             logging.info(f"Presentation generated successfully. Public URL: {public_url}")
