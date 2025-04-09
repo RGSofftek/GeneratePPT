@@ -30,6 +30,13 @@ TEMPLATES_DIRECTORY = f"{DIRECTORY_NAME}/templates"
 INPUTS_DIRECTORY = f"{DIRECTORY_NAME}/inputs"
 OUTPUTS_DIRECTORY = f"{DIRECTORY_NAME}/outputs"
 
+# Nombres de archivo constantes
+TMD_FILE = "TMD.xlsx"
+USERS_FILE = "base_equipo.xlsx"
+PASES_FILE = "Calidad_pases.xlsx"
+REVISIONES_FILE = "Reversiones.xlsx"
+MATURITY_LEVEL_FILE = "NIVEL_MADUREZ.xlsx"
+
 service_url = f"https://{STORAGE_ACCOUNT_NAME}.file.core.windows.net"
 SERVICE_CLIENT = ShareServiceClient(account_url=service_url, credential=SAS_TOKEN)
 SHARE_CLIENT = SERVICE_CLIENT.get_share_client(FILE_SHARE_NAME)
@@ -90,6 +97,15 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
     images_left = margin
 
     num_images = len(images)
+    if num_images == 0:
+        logging.warning("No se proporcionaron imágenes para la diapositiva.")
+        return  # No hay imágenes para agregar
+
+    # Verificar que todos los elementos en images sean BytesIO
+    for img_stream in images:
+        if not isinstance(img_stream, BytesIO):
+            raise ValueError(f"Se esperaba un objeto BytesIO, pero se recibió: {type(img_stream)}")
+
     if num_images == 1:
         rows, cols = 1, 1
     elif num_images <= 2:
@@ -240,6 +256,8 @@ def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matr
         img_bytes.seek(0)
         plt.close()
         maturity_images.append(img_bytes)
+        logging.info(f"Generada imagen de madurez para la práctica {practice}")
+    logging.info(f"Total de imágenes de madurez generadas: {len(maturity_images)}")
     return maturity_images
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -257,27 +275,22 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
     except ValueError:
         return func.HttpResponse("JSON inválido en el cuerpo de la solicitud.", status_code=400)
     
-    required_keys = ["q", "matricula_lider", "tmd_file", "users_file", "pases_file", "revisiones_file", "maturity_level_file", "agenda"]
+    required_keys = ["q", "matricula_lider", "agenda"]
     missing_keys = [key for key in required_keys if key not in req_body]
     if missing_keys:
         return func.HttpResponse(f"Faltan claves requeridas: {missing_keys}", status_code=400)
     
     q = req_body["q"]
     matricula_lider = req_body["matricula_lider"]
-    tmd_file = req_body["tmd_file"]
-    users_file = req_body["users_file"]
-    pases_file = req_body["pases_file"]
-    revisiones_file = req_body["revisiones_file"]
-    maturity_level_file = req_body["maturity_level_file"]
     agenda_items = req_body["agenda"]
     
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            tmd_file_path = download_file_from_share(temp_dir, tmd_file, INPUTS_DIRECTORY)
-            users_file_path = download_file_from_share(temp_dir, users_file, INPUTS_DIRECTORY)
-            pases_file_path = download_file_from_share(temp_dir, pases_file, INPUTS_DIRECTORY)
-            revisiones_file_path = download_file_from_share(temp_dir, revisiones_file, INPUTS_DIRECTORY)
-            maturity_file_path = download_file_from_share(temp_dir, maturity_level_file, INPUTS_DIRECTORY)
+            tmd_file_path = download_file_from_share(temp_dir, TMD_FILE, INPUTS_DIRECTORY)
+            users_file_path = download_file_from_share(temp_dir, USERS_FILE, INPUTS_DIRECTORY)
+            pases_file_path = download_file_from_share(temp_dir, PASES_FILE, INPUTS_DIRECTORY)
+            revisiones_file_path = download_file_from_share(temp_dir, REVISIONES_FILE, INPUTS_DIRECTORY)
+            maturity_file_path = download_file_from_share(temp_dir, MATURITY_LEVEL_FILE, INPUTS_DIRECTORY)
             template_file_path = download_file_from_share(temp_dir, "base_template.pptx", TEMPLATES_DIRECTORY)
             
             kpr_img = retry_call(lambda: generate_kpr_graph(tmd_file_path, users_file_path, matricula_lider, q))
