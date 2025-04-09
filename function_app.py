@@ -26,7 +26,7 @@ TEMPLATES_DIRECTORY = f"{DIRECTORY_NAME}/templates"
 INPUTS_DIRECTORY = f"{DIRECTORY_NAME}/inputs"
 OUTPUTS_DIRECTORY = f"{DIRECTORY_NAME}/outputs"
 
-# Configuración de Azure OpenAI usando azure-ai-inference
+# Validación de variables de entorno para Azure OpenAI
 api_key = os.environ.get("AZURE_OPENAI_KEY")
 if not api_key:
     raise Exception("A key should be provided to invoke the endpoint")
@@ -194,10 +194,11 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list, analys
         height=analysis_height
     )
     analysis_tf = analysisBox.text_frame
+    analysis_tf.word_wrap = True  # Habilitar ajuste de texto
     analysis_tf.text = analysis_text
     for paragraph in analysis_tf.paragraphs:
         for run in paragraph.runs:
-            run.font.size = Pt(12)
+            run.font.size = Pt(14)
             run.font.color.rgb = RGBColor(80, 80, 80)
 
 def update_agenda_slide(prs: Presentation, slide, new_agenda_items: list):
