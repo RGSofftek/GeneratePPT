@@ -1,6 +1,7 @@
 """
 Módulo de Azure Function que genera una presentación PowerPoint integrando visualizaciones de datos.
 En este experimento, usa las diapositivas 3 a 5 de la plantilla existente, respetando sus títulos y agregando imágenes y análisis dinámicamente.
+También actualiza la diapositiva 2 (agenda) con los nuevos puntos proporcionados en el JSON.
 """
 
 import azure.functions as func
@@ -73,29 +74,21 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
     Agrega imágenes y análisis a una diapositiva existente, respetando el título preexistente.
     Usa las dimensiones de la presentación (prs) para calcular el espacio disponible.
     """
-    # Definir márgenes y alturas
     margin = Inches(0.5)
     analysis_height = Inches(1)
 
-    # Encontrar el título existente (buscar el shape más alto en la parte superior)
     title_shape = None
     for shape in slide.shapes:
-        if shape.has_text_frame and shape.text.strip() and shape.top < Inches(2):  # Asumimos que el título está arriba
+        if shape.has_text_frame and shape.text.strip() and shape.top < Inches(2):
             title_shape = shape
             break
 
-    # Calcular espacio disponible debajo del título
-    if title_shape:
-        title_bottom = title_shape.top + title_shape.height
-    else:
-        title_bottom = margin  # Si no hay título, usar margen superior
-
+    title_bottom = title_shape.top + title_shape.height if title_shape else margin
     available_height = prs.slide_height - title_bottom - margin - analysis_height
     available_width = prs.slide_width - 2 * margin
     images_top = title_bottom
     images_left = margin
 
-    # Determinar rejilla según el número de imágenes
     num_images = len(images)
     if num_images == 1:
         rows, cols = 1, 1
@@ -110,7 +103,6 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
     cell_width = available_width / cols
     cell_height = available_height / rows
 
-    # Insertar imágenes con escalado
     for i, img_stream in enumerate(images):
         col = i % cols
         row = i // cols
@@ -134,7 +126,6 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
 
         slide.shapes.add_picture(img_stream, picture_left, picture_top, width=picture_width, height=picture_height)
 
-    # Insertar análisis como textbox
     analysis_text = "Este es el análisis generado para la gráfica."
     analysisBox = slide.shapes.add_textbox(
         left=margin,
@@ -148,6 +139,45 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
         for run in paragraph.runs:
             run.font.size = Pt(14)
             run.font.color.rgb = RGBColor(80, 80, 80)
+
+def update_agenda_slide(prs: Presentation, slide, new_agenda_items: list):
+    """
+    Actualiza la diapositiva de la agenda con los nuevos puntos del JSON, respetando el formato existente.
+    Args:
+        prs: La presentación PowerPoint.
+        slide: La diapositiva de la agenda (índice 1).
+        new_agenda_items: Lista de strings con los nuevos puntos de la agenda.
+    """
+    agenda_textbox = None
+    for shape in slide.shapes:
+        if shape.has_text_frame:
+            text_frame = shape.text_frame
+            if len(text_frame.paragraphs) > 1 and not text_frame.text.strip().lower().startswith("agenda"):
+                agenda_textbox = shape
+                break
+
+    if not agenda_textbox:
+        raise ValueError("No se encontró el cuadro de texto de la agenda en la diapositiva.")
+
+    text_frame = agenda_textbox.text_frame
+    original_paragraph = text_frame.paragraphs[0]
+    original_font = original_paragraph.runs[0].font if original_paragraph.runs else None
+    text_frame.clear()
+
+    for item in new_agenda_items:
+        p = text_frame.add_paragraph()
+        p.text = item
+        p.level = 0
+        if original_font:
+            run = p.runs[0]
+            run.font.size = original_font.size
+            run.font.name = original_font.name
+            try:
+                run.font.color.rgb = original_font.color.rgb
+            except AttributeError:
+                pass
+
+    logging.info("Agenda actualizada con los nuevos puntos.")
 
 def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> BytesIO:
     df_users = pd.read_excel(users_file_path)
@@ -227,7 +257,7 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
     except ValueError:
         return func.HttpResponse("JSON inválido en el cuerpo de la solicitud.", status_code=400)
     
-    required_keys = ["q", "matricula_lider", "tmd_file", "users_file", "pases_file", "revisiones_file", "maturity_level_file"]
+    required_keys = ["q", "matricula_lider", "tmd_file", "users_file", "pases_file", "revisiones_file", "maturity_level_file", "agenda"]
     missing_keys = [key for key in required_keys if key not in req_body]
     if missing_keys:
         return func.HttpResponse(f"Faltan claves requeridas: {missing_keys}", status_code=400)
@@ -239,6 +269,7 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
     pases_file = req_body["pases_file"]
     revisiones_file = req_body["revisiones_file"]
     maturity_level_file = req_body["maturity_level_file"]
+    agenda_items = req_body["agenda"]
     
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
@@ -255,11 +286,10 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
             
             prs = Presentation(template_file_path)
             
-            # Asegurarse de que haya al menos 5 diapositivas
             if len(prs.slides) < 5:
                 raise ValueError("La plantilla debe tener al menos 5 diapositivas.")
             
-            # Agregar contenido a las diapositivas existentes (índices 2, 3, 4 corresponden a diapositivas 3, 4, 5)
+            update_agenda_slide(prs, prs.slides[1], agenda_items)
             add_content_to_existing_slide(prs, prs.slides[2], images=[kpr_img])
             add_content_to_existing_slide(prs, prs.slides[3], images=[kr_img])
             add_content_to_existing_slide(prs, prs.slides[4], images=maturity_imgs)
