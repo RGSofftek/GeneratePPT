@@ -1,9 +1,3 @@
-"""
-Módulo de Azure Function que genera una presentación PowerPoint integrando visualizaciones de datos.
-En este experimento, usa las diapositivas 3 a 5 de la plantilla existente, respetando sus títulos y agregando imágenes y análisis dinámicamente.
-También actualiza la diapositiva 2 (agenda) con los nuevos puntos proporcionados en el JSON.
-"""
-
 import azure.functions as func
 import logging
 import os
@@ -19,6 +13,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import tempfile
 from PIL import Image
+from azure.ai.inference import ChatCompletionsClient
+from azure.core.credentials import AzureKeyCredential
 
 # Configuración de variables de entorno
 STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME")
@@ -29,6 +25,28 @@ DIRECTORY_NAME = os.environ.get("DIRECTORY_NAME")
 TEMPLATES_DIRECTORY = f"{DIRECTORY_NAME}/templates"
 INPUTS_DIRECTORY = f"{DIRECTORY_NAME}/inputs"
 OUTPUTS_DIRECTORY = f"{DIRECTORY_NAME}/outputs"
+
+# Configuración de Azure OpenAI usando azure-ai-inference
+api_key = os.environ.get("AZURE_OPENAI_KEY")
+if not api_key:
+    raise Exception("A key should be provided to invoke the endpoint")
+
+base_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+if not base_endpoint:
+    raise Exception("An endpoint should be provided to invoke the service")
+
+deployment_name = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+if not deployment_name:
+    raise Exception("A deployment name should be provided")
+
+# Asegurarse de que el endpoint base no tenga una barra doble o falte una barra
+base_endpoint = base_endpoint.rstrip("/")
+endpoint = f"{base_endpoint}/openai/deployments/{deployment_name}"
+
+client = ChatCompletionsClient(
+    endpoint=endpoint,
+    credential=AzureKeyCredential(api_key)
+)
 
 # Nombres de archivo constantes
 TMD_FILE = "TMD.xlsx"
@@ -65,7 +83,7 @@ def upload_file_to_share(local_file_path: str, filename: str, folder: str) -> No
 def generate_file_url(filename: str, folder: str) -> str:
     return f"https://{STORAGE_ACCOUNT_NAME}.file.core.windows.net/{FILE_SHARE_NAME}/{folder}/{filename}?{SAS_TOKEN}"
 
-def retry_call(func_call, attempts: int = 2, delay: int = 1):
+def retry_call(func_call, attempts: int = 3, delay: int = 1):
     last_exception = None
     for attempt in range(attempts):
         try:
@@ -76,11 +94,43 @@ def retry_call(func_call, attempts: int = 2, delay: int = 1):
             time.sleep(delay)
     raise last_exception
 
-def add_content_to_existing_slide(prs: Presentation, slide, images: list):
+def get_combined_analysis(kpr_desc: str, kr_desc: str, maturity_desc: str) -> tuple:
+    """Envía un solo prompt con las descripciones de todas las gráficas y devuelve análisis individuales."""
+    prompt = f"""
+    Eres un analista experto en datos. Analiza estas gráficas y devuelve una interpretación analítica concisa para cada una:
+    1. KPR: {kpr_desc}
+    2. KR: {kr_desc}
+    3. Madurez: {maturity_desc}
+    Formato de respuesta: [KPR] texto [KR] texto [Madurez] texto
+    Limita cada análisis a unas 20-30 palabras para optimizar espacio y tokens.
     """
-    Agrega imágenes y análisis a una diapositiva existente, respetando el título preexistente.
-    Usa las dimensiones de la presentación (prs) para calcular el espacio disponible.
-    """
+    payload = {
+        "messages": [
+            {"role": "system", "content": "Proporciona análisis analíticos breves y precisos."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 200,
+        "temperature": 1.0,
+        "top_p": 1.0
+    }
+    try:
+        response = client.complete(payload)
+        text = response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"Error al invocar Azure OpenAI: {e}")
+        return "Análisis no disponible.", "Análisis no disponible.", "Análisis no disponible."
+    
+    try:
+        kpr = text.split("[KPR]")[1].split("[KR]")[0].strip()
+        kr = text.split("[KR]")[1].split("[Madurez]")[0].strip()
+        maturity = text.split("[Madurez]")[1].strip()
+    except IndexError:
+        logging.error("Formato de respuesta inválido, usando valores por defecto.")
+        kpr = kr = maturity = "Análisis no disponible."
+    return kpr, kr, maturity
+
+def add_content_to_existing_slide(prs: Presentation, slide, images: list, analysis_text: str):
+    """Agrega imágenes y análisis a una diapositiva existente."""
     margin = Inches(0.5)
     analysis_height = Inches(1)
 
@@ -99,12 +149,7 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
     num_images = len(images)
     if num_images == 0:
         logging.warning("No se proporcionaron imágenes para la diapositiva.")
-        return  # No hay imágenes para agregar
-
-    # Verificar que todos los elementos en images sean BytesIO
-    for img_stream in images:
-        if not isinstance(img_stream, BytesIO):
-            raise ValueError(f"Se esperaba un objeto BytesIO, pero se recibió: {type(img_stream)}")
+        return
 
     if num_images == 1:
         rows, cols = 1, 1
@@ -142,7 +187,6 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
 
         slide.shapes.add_picture(img_stream, picture_left, picture_top, width=picture_width, height=picture_height)
 
-    analysis_text = "Este es el análisis generado para la gráfica."
     analysisBox = slide.shapes.add_textbox(
         left=margin,
         top=prs.slide_height - margin - analysis_height,
@@ -153,17 +197,10 @@ def add_content_to_existing_slide(prs: Presentation, slide, images: list):
     analysis_tf.text = analysis_text
     for paragraph in analysis_tf.paragraphs:
         for run in paragraph.runs:
-            run.font.size = Pt(14)
+            run.font.size = Pt(12)
             run.font.color.rgb = RGBColor(80, 80, 80)
 
 def update_agenda_slide(prs: Presentation, slide, new_agenda_items: list):
-    """
-    Actualiza la diapositiva de la agenda con los nuevos puntos del JSON, respetando el formato existente.
-    Args:
-        prs: La presentación PowerPoint.
-        slide: La diapositiva de la agenda (índice 1).
-        new_agenda_items: Lista de strings con los nuevos puntos de la agenda.
-    """
     agenda_textbox = None
     for shape in slide.shapes:
         if shape.has_text_frame:
@@ -193,9 +230,7 @@ def update_agenda_slide(prs: Presentation, slide, new_agenda_items: list):
             except AttributeError:
                 pass
 
-    logging.info("Agenda actualizada con los nuevos puntos.")
-
-def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> BytesIO:
+def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> tuple:
     df_users = pd.read_excel(users_file_path)
     df_tmd = pd.read_excel(tmd_file_path)
     users_list = df_users[df_users['Matricula Lider'] == matricula_lider]['Matricula'].tolist()
@@ -211,9 +246,10 @@ def generate_kpr_graph(tmd_file_path: str, users_file_path: str, matricula_lider
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
     plt.close()
-    return img_bytes
+    data_desc = f"Gráfica de {q} por Líder Técnico: {', '.join([f'{lt}: {val}' for lt, val in zip(df_filtered['Lider Técnico'], df_filtered[q])])}"
+    return img_bytes, data_desc
 
-def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesIO:
+def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> tuple:
     quarters = ['Q1 01', 'Q1 02', 'Q1 03', 'Q2 01', 'Q2 02', 'Q2 03']
     df1 = pd.read_excel(pases_file_path)
     df2 = pd.read_excel(revisiones_file_path)
@@ -221,8 +257,8 @@ def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesI
     df2_grouped = df2[quarters].sum(axis=0)
     plt.figure(figsize=(10, 7))
     x = range(len(quarters))
-    plt.bar([pos - 0.2 for pos in x], df1_grouped, color='#000474', width=0.4, label='Dataset 1')
-    plt.bar([pos + 0.2 for pos in x], df2_grouped, color='#f46a34', width=0.4, label='Dataset 2')
+    plt.bar([pos - 0.2 for pos in x], df1_grouped, color='#000474', width=0.4, label='Pases Exitosos')
+    plt.bar([pos + 0.2 for pos in x], df2_grouped, color='#f46a34', width=0.4, label='Reversiones')
     plt.title('Pases Exitosos vs Reversiones x Q (KR)', fontsize=16)
     plt.xlabel('Trimestre', fontsize=12)
     plt.ylabel('Valor Total', fontsize=12)
@@ -233,15 +269,17 @@ def generate_kr_graph(pases_file_path: str, revisiones_file_path: str) -> BytesI
     plt.savefig(img_bytes, format='png')
     img_bytes.seek(0)
     plt.close()
-    return img_bytes
+    data_desc = f"Pases Exitosos vs Reversiones por trimestre: Pases={dict(df1_grouped)}, Reversiones={dict(df2_grouped)}"
+    return img_bytes, data_desc
 
-def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> list:
+def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matricula_lider: str, q: str) -> tuple:
     df_users = pd.read_excel(users_file_path)
     df_maturity = pd.read_excel(maturity_file_path)
     users_list = df_users[df_users['Matricula Lider'] == matricula_lider]['Matricula'].tolist()
     df_filtered = df_maturity[df_maturity["Matricula LT"].isin(users_list)]
     practices = df_filtered['PRACTICA'].unique()
     maturity_images = []
+    maturity_desc_parts = []
     for practice in practices[:4]:
         df_practice = df_filtered[df_filtered['PRACTICA'] == practice]
         plt.figure(figsize=(10, 6))
@@ -256,9 +294,9 @@ def generate_maturity_graphs(maturity_file_path: str, users_file_path: str, matr
         img_bytes.seek(0)
         plt.close()
         maturity_images.append(img_bytes)
-        logging.info(f"Generada imagen de madurez para la práctica {practice}")
-    logging.info(f"Total de imágenes de madurez generadas: {len(maturity_images)}")
-    return maturity_images
+        maturity_desc_parts.append(f"{practice}: {', '.join([f'{lt}: {val}' for lt, val in zip(df_practice['Lider Técnico'], df_practice[q])])}")
+    data_desc = "Niveles de madurez por práctica: " + "; ".join(maturity_desc_parts)
+    return maturity_images, data_desc
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -293,19 +331,22 @@ def generate_presentation(req: func.HttpRequest) -> func.HttpResponse:
             maturity_file_path = download_file_from_share(temp_dir, MATURITY_LEVEL_FILE, INPUTS_DIRECTORY)
             template_file_path = download_file_from_share(temp_dir, "base_template.pptx", TEMPLATES_DIRECTORY)
             
-            kpr_img = retry_call(lambda: generate_kpr_graph(tmd_file_path, users_file_path, matricula_lider, q))
-            kr_img = retry_call(lambda: generate_kr_graph(pases_file_path, revisiones_file_path))
-            maturity_imgs = retry_call(lambda: generate_maturity_graphs(maturity_file_path, users_file_path, matricula_lider, q))
+            # Generar gráficas y descripciones
+            kpr_img, kpr_desc = retry_call(lambda: generate_kpr_graph(tmd_file_path, users_file_path, matricula_lider, q))
+            kr_img, kr_desc = retry_call(lambda: generate_kr_graph(pases_file_path, revisiones_file_path))
+            maturity_imgs, maturity_desc = retry_call(lambda: generate_maturity_graphs(maturity_file_path, users_file_path, matricula_lider, q))
+            
+            # Obtener análisis combinado en una sola llamada
+            kpr_analysis, kr_analysis, maturity_analysis = get_combined_analysis(kpr_desc, kr_desc, maturity_desc)
             
             prs = Presentation(template_file_path)
-            
             if len(prs.slides) < 5:
                 raise ValueError("La plantilla debe tener al menos 5 diapositivas.")
             
             update_agenda_slide(prs, prs.slides[1], agenda_items)
-            add_content_to_existing_slide(prs, prs.slides[2], images=[kpr_img])
-            add_content_to_existing_slide(prs, prs.slides[3], images=[kr_img])
-            add_content_to_existing_slide(prs, prs.slides[4], images=maturity_imgs)
+            add_content_to_existing_slide(prs, prs.slides[2], images=[kpr_img], analysis_text=kpr_analysis)
+            add_content_to_existing_slide(prs, prs.slides[3], images=[kr_img], analysis_text=kr_analysis)
+            add_content_to_existing_slide(prs, prs.slides[4], images=maturity_imgs, analysis_text=maturity_analysis)
             
             file_date = datetime.now().strftime("%m%d%y")
             output_filename = f"{file_date} Presentation.pptx"

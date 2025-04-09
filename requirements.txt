@@ -8,3 +8,4 @@ pandas
 matplotlib
 python-pptx
 openpyxl
+azure-ai-inference
